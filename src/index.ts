@@ -4,29 +4,91 @@ import { z } from "zod";
 
 const GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc";
 
+// How long we're willing to keep retrying a single request before giving up.
+const MAX_RETRIES = 4;
+// Base delay for exponential backoff (ms). Sequence: 500, 1000, 2000, 4000.
+const BASE_DELAY_MS = 500;
+// How long successful responses are cached (seconds). Identical queries
+// from any team member within this window are served from cache instead
+// of hitting GDELT again, which also reduces how often we get rate-limited.
+const CACHE_TTL_SECONDS = 300;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Small helper so all three tools share the same fetch + error handling logic.
+ * Adds two things on top of a plain fetch:
+ *   1. Retries with exponential backoff when GDELT returns 429 (or a 5xx
+ *      transient error), instead of failing on the very first hiccup.
+ *   2. A short-lived shared cache (Cloudflare's edge Cache API) so that the
+ *      same query fired by different team members within a few minutes of
+ *      each other reuses one result instead of generating N calls to GDELT.
  */
 async function callGdelt(params: Record<string, string>) {
   const url = `${GDELT_DOC_API}?${new URLSearchParams(params).toString()}`;
-  const res = await fetch(url, {
-    headers: { "User-Agent": "gdelt-mcp/1.0 (internal team server)" },
-  });
+  const cacheKey = new Request(url, { method: "GET" });
+  const cache = caches.default;
 
-  if (!res.ok) {
-    throw new Error(`GDELT API returned ${res.status} ${res.statusText}`);
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    return cached.json();
   }
 
-  const text = await res.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    // GDELT occasionally returns an HTML error page (e.g. for malformed
-    // queries) instead of JSON even with a 200 status.
-    throw new Error(
-      `GDELT API did not return valid JSON. First 200 chars: ${text.slice(0, 200)}`,
-    );
+  let lastError: Error | null = null;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "gdelt-mcp/1.0 (internal team server)" },
+    });
+
+    if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+      lastError = new Error(`GDELT API returned ${res.status} ${res.statusText}`);
+      if (attempt < MAX_RETRIES) {
+        // Respect Retry-After if GDELT sends one, otherwise back off ourselves.
+        const retryAfterHeader = res.headers.get("Retry-After");
+        const retryAfterMs = retryAfterHeader
+          ? Number(retryAfterHeader) * 1000
+          : BASE_DELAY_MS * 2 ** attempt;
+        await sleep(retryAfterMs);
+        continue;
+      }
+      throw lastError;
+    }
+
+    if (!res.ok) {
+      // A non-retryable error (e.g. 400 bad query) - fail immediately.
+      throw new Error(`GDELT API returned ${res.status} ${res.statusText}`);
+    }
+
+    const text = await res.text();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // GDELT occasionally returns an HTML error page (e.g. for malformed
+      // queries) instead of JSON even with a 200 status.
+      throw new Error(
+        `GDELT API did not return valid JSON. First 200 chars: ${text.slice(0, 200)}`,
+      );
+    }
+
+    // Cache the good response for everyone else's benefit.
+    const cacheResponse = new Response(JSON.stringify(data), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": `max-age=${CACHE_TTL_SECONDS}`,
+      },
+    });
+    await cache.put(cacheKey, cacheResponse);
+
+    return data;
   }
+
+  // Unreachable in practice, but keeps TypeScript happy.
+  throw lastError ?? new Error("GDELT API request failed for an unknown reason.");
 }
 
 function errorResult(err: unknown) {

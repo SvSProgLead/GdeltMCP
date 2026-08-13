@@ -91,6 +91,66 @@ async function callGdelt(params: Record<string, string>) {
   throw lastError ?? new Error("GDELT API request failed for an unknown reason.");
 }
 
+/**
+ * Lowercases, strips punctuation and collapses whitespace so that titles
+ * differing only in casing, hyphens/dashes, or a trailing " - SiteName"
+ * still compare equal.
+ */
+function normalizeTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/**
+ * Pulls the last non-empty path segment out of a URL. Syndicated copies of
+ * the same wire story are frequently published on many different domains
+ * (e.g. a dozen local radio station sites) but keep the same unique story
+ * ID in the URL path, so this catches duplicates that normalizeTitle alone
+ * might miss due to per-site title rewriting.
+ */
+function extractUrlId(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    return segments[segments.length - 1] ?? parsed.pathname;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Removes duplicate/syndicated articles from a GDELT ArtList result.
+ * Two articles are considered the same story if they share a normalized
+ * title OR the same trailing URL path segment. Keeps the first (most
+ * relevant, since GDELT ArtList preserves sort order) occurrence of each.
+ */
+function dedupeArticles<T extends { title?: string; url?: string }>(
+  articles: T[],
+): T[] {
+  const seenTitles = new Set<string>();
+  const seenUrlIds = new Set<string>();
+  const result: T[] = [];
+
+  for (const article of articles) {
+    const titleKey = normalizeTitle(article.title ?? "");
+    const urlId = article.url ? extractUrlId(article.url) : "";
+
+    const isDuplicate =
+      (titleKey.length > 0 && seenTitles.has(titleKey)) ||
+      (urlId.length > 0 && seenUrlIds.has(urlId));
+
+    if (isDuplicate) continue;
+
+    if (titleKey.length > 0) seenTitles.add(titleKey);
+    if (urlId.length > 0) seenUrlIds.add(urlId);
+    result.push(article);
+  }
+
+  return result;
+}
+
 function errorResult(err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
   return {
@@ -168,9 +228,11 @@ function createServer() {
           tone: a.tone,
         }));
 
+        const deduped = dedupeArticles(articles);
+
         return {
           content: [
-            { type: "text" as const, text: JSON.stringify(articles, null, 2) },
+            { type: "text" as const, text: JSON.stringify(deduped, null, 2) },
           ],
         };
       } catch (err) {

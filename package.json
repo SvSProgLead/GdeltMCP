@@ -1,0 +1,21 @@
+{
+  "name": "gdelt-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remote MCP server exposing GDELT news-monitoring data as Claude tools",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "agents": "^0.20.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "typescript": "^5.5.4",
+    "@cloudflare/workers-types": "^5.20260811.1"
+  }
+}

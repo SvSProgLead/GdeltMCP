@@ -6,9 +6,23 @@ er Worker anropar `api.gdeltproject.org` direkt.
 
 ## Verktyg
 
-- **search_articles** – sök nyhetsartiklar på ett ämne
+- **search_articles** – sök nyhetsartiklar på ett ämne (sorteras som standard på
+  HybridRel; `include_tone: true` hämtar ungefärlig tone per artikel via ToneChart)
 - **timeline_tone** – daglig sentimentnivå (-100 till +100) för ett ämne
 - **timeline_volume** – daglig andel av det globala nyhetsflödet för ett ämne
+
+### Frågor och rate limit
+
+- Flerordsfraser skickas som exakt fras: `electronic warfare sourcecountry:sweden`
+  blir `"electronic warfare" sourcecountry:sweden`. Frågor som redan har
+  citattecken, parenteser eller `OR` lämnas orörda. Stäng av med `exact_phrase: false`.
+- GDELT tillåter ungefär ett anrop per 5 s. En Durable Object (`GdeltGate`)
+  håller minst 5,5 s mellan alla anrop från Workern, oavsett vem som anropar.
+  Vid 429 görs nya försök med backoff (6, 12, 24 s, Retry-After respekteras)
+  inom en budget på ca 50 s. Därefter kommer ett tydligt `rate_limited`-fel.
+  Identiska frågor cachas i 10 minuter.
+- GDELT spärrar per IP, och Cloudflares utgående IP-adresser delas med andra
+  Workers. Enstaka 429 kan därför komma även när vi själva håller takten.
 
 ## Förutsättningar
 

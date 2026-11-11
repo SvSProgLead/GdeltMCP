@@ -1,95 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
+import { callGdelt, GdeltError, prepareQuery } from "./gdelt";
 
-const GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc";
-
-// How long we're willing to keep retrying a single request before giving up.
-const MAX_RETRIES = 4;
-// Base delay for exponential backoff (ms). Sequence: 500, 1000, 2000, 4000.
-const BASE_DELAY_MS = 500;
-// How long successful responses are cached (seconds). Identical queries
-// from any team member within this window are served from cache instead
-// of hitting GDELT again, which also reduces how often we get rate-limited.
-const CACHE_TTL_SECONDS = 300;
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Small helper so all three tools share the same fetch + error handling logic.
- * Adds two things on top of a plain fetch:
- *   1. Retries with exponential backoff when GDELT returns 429 (or a 5xx
- *      transient error), instead of failing on the very first hiccup.
- *   2. A short-lived shared cache (Cloudflare's edge Cache API) so that the
- *      same query fired by different team members within a few minutes of
- *      each other reuses one result instead of generating N calls to GDELT.
- */
-async function callGdelt(params: Record<string, string>) {
-  const url = `${GDELT_DOC_API}?${new URLSearchParams(params).toString()}`;
-  const cacheKey = new Request(url, { method: "GET" });
-  const cache = caches.default;
-
-  const cached = await cache.match(cacheKey);
-  if (cached) {
-    return cached.json();
-  }
-
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const res = await fetch(url, {
-      headers: { "User-Agent": "gdelt-mcp/1.0 (internal team server)" },
-    });
-
-    if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
-      lastError = new Error(`GDELT API returned ${res.status} ${res.statusText}`);
-      if (attempt < MAX_RETRIES) {
-        // Respect Retry-After if GDELT sends one, otherwise back off ourselves.
-        const retryAfterHeader = res.headers.get("Retry-After");
-        const retryAfterMs = retryAfterHeader
-          ? Number(retryAfterHeader) * 1000
-          : BASE_DELAY_MS * 2 ** attempt;
-        await sleep(retryAfterMs);
-        continue;
-      }
-      throw lastError;
-    }
-
-    if (!res.ok) {
-      // A non-retryable error (e.g. 400 bad query) - fail immediately.
-      throw new Error(`GDELT API returned ${res.status} ${res.statusText}`);
-    }
-
-    const text = await res.text();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let data: any;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      // GDELT occasionally returns an HTML error page (e.g. for malformed
-      // queries) instead of JSON even with a 200 status.
-      throw new Error(
-        `GDELT API did not return valid JSON. First 200 chars: ${text.slice(0, 200)}`,
-      );
-    }
-
-    // Cache the good response for everyone else's benefit.
-    const cacheResponse = new Response(JSON.stringify(data), {
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": `max-age=${CACHE_TTL_SECONDS}`,
-      },
-    });
-    await cache.put(cacheKey, cacheResponse);
-
-    return data;
-  }
-
-  // Unreachable in practice, but keeps TypeScript happy.
-  throw lastError ?? new Error("GDELT API request failed for an unknown reason.");
-}
+export { GdeltGate } from "./gdelt";
 
 /**
  * Lowercases, strips punctuation and collapses whitespace so that titles
@@ -153,16 +67,44 @@ function dedupeArticles<T extends { title?: string; url?: string }>(
 
 function errorResult(err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
+  const kind = err instanceof GdeltError ? err.kind : "internal";
   return {
-    content: [{ type: "text" as const, text: `Error: ${message}` }],
+    content: [{ type: "text" as const, text: `Error (${kind}): ${message}` }],
     isError: true,
   };
 }
 
+/**
+ * ArtList does not carry a tone per article. ToneChart does: it buckets the
+ * matching articles by tone (-100..+100, in integer bins) and lists the top
+ * articles of each bin. Map URL -> bin so search_articles can attach an
+ * approximate tone to the articles that appear there.
+ */
+async function toneByUrl(params: Record<string, string>): Promise<Map<string, number>> {
+  const data = await callGdelt({ ...params, mode: "ToneChart" });
+  const map = new Map<string, number>();
+  for (const bin of data?.tonechart ?? []) {
+    for (const art of bin?.toparts ?? []) {
+      if (art?.url && typeof bin.bin === "number") map.set(art.url, bin.bin);
+    }
+  }
+  return map;
+}
+
+const exactPhraseField = z
+  .boolean()
+  .optional()
+  .describe(
+    "Default true: plain multi-word input is searched as one exact phrase (electronic warfare -> \"electronic warfare\"); GDELT operators like sourcecountry:sweden are kept outside the quotes. Set false to match the words independently. Queries that already contain quotes, parentheses or OR are never changed.",
+  );
+
 const searchArticlesInput = z.object({
   query: z
     .string()
-    .describe("Search terms, e.g. 'climate summit' or 'Sweden election'"),
+    .describe(
+      "Search terms, e.g. 'electronic warfare' or 'drone swarm sourcecountry:ukraine'. Supports GDELT operators (sourcecountry:, sourcelang:, domain:, theme:, OR, -exclude).",
+    ),
+  exact_phrase: exactPhraseField,
   timespan: z
     .string()
     .optional()
@@ -172,7 +114,7 @@ const searchArticlesInput = z.object({
   sort: z
     .enum(["DateDesc", "DateAsc", "ToneAsc", "ToneDesc", "HybridRel"])
     .optional()
-    .describe("Sort order. Defaults to DateDesc (most recent first)."),
+    .describe("Sort order. Defaults to HybridRel (relevance weighted by recency); DateDesc = newest first."),
   max_records: z
     .number()
     .int()
@@ -180,10 +122,17 @@ const searchArticlesInput = z.object({
     .max(250)
     .optional()
     .describe("Maximum number of articles to return (1-250). Defaults to 25."),
+  include_tone: z
+    .boolean()
+    .optional()
+    .describe(
+      "Also fetch GDELT's ToneChart and attach an approximate tone (integer bin, -100..+100) to articles listed there. Costs one extra GDELT call (~5 s). Default false.",
+    ),
 });
 
 const timelineInput = z.object({
-  query: z.string().describe("Search terms to track over time"),
+  query: z.string().describe("Search terms to track over time (GDELT operators allowed)."),
+  exact_phrase: exactPhraseField,
   timespan: z
     .string()
     .optional()
@@ -198,42 +147,57 @@ const timelineInput = z.object({
 function createServer() {
   const server = new McpServer({
     name: "gdelt-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   server.registerTool(
     "search_articles",
     {
       description:
-        "Search GDELT for recent news articles matching a query. Returns title, url, domain, language, publish date and tone for each match.",
+        "Search GDELT for recent news articles matching a query. Returns title, url, domain, language, source country and seen date per article (syndicated duplicates removed). Multi-word input is searched as an exact phrase by default. Tone is only included when include_tone=true (approximate, from GDELT's ToneChart); for tone over time use timeline_tone. Calls are spaced >=5 s apart because of GDELT's rate limit, so expect a few seconds' latency.",
       inputSchema: searchArticlesInput,
     },
-    async ({ query, timespan, sort, max_records }) => {
+    async ({ query, exact_phrase, timespan, sort, max_records, include_tone }) => {
       try {
+        const base = { query: prepareQuery(query, exact_phrase ?? true), format: "json", timespan: timespan ?? "1d" };
         const data = await callGdelt({
-          query,
+          ...base,
           mode: "ArtList",
-          format: "json",
-          timespan: timespan ?? "1d",
-          sort: sort ?? "DateDesc",
+          sort: sort ?? "HybridRel",
           maxrecords: String(max_records ?? 25),
         });
+
+        let tones: Map<string, number> | null = null;
+        let toneNote: string | undefined;
+        if (include_tone) {
+          try {
+            tones = await toneByUrl(base);
+          } catch (err) {
+            toneNote = `tone unavailable: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
 
         const articles = (data.articles ?? []).map((a: any) => ({
           title: a.title,
           url: a.url,
           domain: a.domain,
           language: a.language,
+          sourcecountry: a.sourcecountry,
           seendate: a.seendate,
-          tone: a.tone,
+          ...(tones ? { tone: tones.get(a.url) ?? null } : {}),
         }));
 
         const deduped = dedupeArticles(articles);
+        const payload = {
+          query_sent: base.query,
+          count: deduped.length,
+          ...(tones ? { tone_note: "tone = GDELT ToneChart bin; null if the article is not among ToneChart's top articles" } : {}),
+          ...(toneNote ? { tone_note: toneNote } : {}),
+          articles: deduped,
+        };
 
         return {
-          content: [
-            { type: "text" as const, text: JSON.stringify(deduped, null, 2) },
-          ],
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
         };
       } catch (err) {
         return errorResult(err);
@@ -248,10 +212,10 @@ function createServer() {
         "Get the daily average sentiment tone (-100 very negative to +100 very positive) for a topic over time, based on GDELT's global news coverage.",
       inputSchema: timelineInput,
     },
-    async ({ query, timespan }) => {
+    async ({ query, exact_phrase, timespan }) => {
       try {
         const data = await callGdelt({
-          query,
+          query: prepareQuery(query, exact_phrase ?? true),
           mode: "TimelineTone",
           format: "json",
           timespan: timespan ?? "1m",
@@ -275,10 +239,10 @@ function createServer() {
         "Get the daily news volume (as a % of global news coverage) for a topic over time, based on GDELT's global news monitoring.",
       inputSchema: timelineInput,
     },
-    async ({ query, timespan }) => {
+    async ({ query, exact_phrase, timespan }) => {
       try {
         const data = await callGdelt({
-          query,
+          query: prepareQuery(query, exact_phrase ?? true),
           mode: "TimelineVolInfo",
           format: "json",
           timespan: timespan ?? "1m",

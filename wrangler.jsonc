@@ -6,5 +6,11 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true
-  }
+  },
+  // One Durable Object instance spaces all GDELT calls >= 5 s apart,
+  // across every isolate serving this Worker (GDELT returns 429 otherwise).
+  "durable_objects": {
+    "bindings": [{ "name": "GDELT_GATE", "class_name": "GdeltGate" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GdeltGate"] }]
 }
